@@ -280,6 +280,7 @@ def main():
     ap.add_argument('--critical-classes', default='Diff100,Diff90,SE50')
     ap.add_argument('--critical-nets', default='', help='regex of extra critical net names')
     ap.add_argument('--no-stitch', action='store_true', help='do not try stitching vias for stray GND islands')
+    ap.add_argument('--plan-arg', action='append', default=[], help='extra pns_plan.py option (repeatable)')
     args = ap.parse_args()
 
     TOOL_ARGS.extend([f'--critical-classes={args.critical_classes}'])
@@ -305,7 +306,7 @@ def main():
         drc_path = wd.dir / f'{current}.drc_refill.json'
         plan_jobs = wd.dir / f'{current}.plan_jobs.json'
         with open(wd.dir / f'{current}.plan.json', 'w') as report:
-            subprocess.run([PYTHON, str(HERE / 'pns_plan.py'), str(geom), str(drc_path), str(plan_jobs)],
+            subprocess.run([PYTHON, str(HERE / 'pns_plan.py'), str(geom), str(drc_path), str(plan_jobs), *args.plan_arg],
                            check=True, stdout=report, stderr=subprocess.DEVNULL)
         jobs = [j for j in json.load(open(plan_jobs)) if j['gap'] not in rejected]
         if not jobs:
@@ -350,8 +351,25 @@ def main():
             drc = wd.drc(name, refill=True)
             problem = health(drc, baseline, wd.dir / f'{name}.kicad_pcb')
             if problem:
-                print(f'round {r}: still {problem} with the remaining routes together; stopping', flush=True)
-                break
+                # Fine alone, not together: add them one at a time and keep what stays healthy.
+                print(f'round {r}: {problem} with the remaining routes together; adding them one by one', flush=True)
+                accepted, drc = [], None
+                for k, job in enumerate(keep):
+                    trial = f'{name}_g{k}'
+                    res = wd.route(current, accepted + [job], trial)
+                    if res['routed'] != len(accepted) + 1:
+                        continue
+                    trial_drc = wd.drc(trial, refill=True)
+                    if health(trial_drc, baseline, wd.dir / f'{trial}.kicad_pcb') is None:
+                        accepted.append(job)
+                        drc, result = trial_drc, res
+                        shutil.copyfile(wd.dir / f'{trial}.kicad_pcb', wd.dir / f'{name}.kicad_pcb')
+                    else:
+                        print(f'  leaving out {job["gap"]}', flush=True)
+                if not accepted:
+                    print(f'round {r}: nothing combines cleanly; stopping', flush=True)
+                    break
+                jobs = keep = accepted
             routed = [j for j, res in zip(keep, result['jobs']) if res['status'] == 'routed']
 
         current, current_drc = name, drc

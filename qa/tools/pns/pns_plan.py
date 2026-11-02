@@ -37,9 +37,9 @@ RAIL_NET = re.compile(r'^\+3V3')
 OUTER_LAYERS = {'F.Cu', 'B.Cu'}
 SHOVED_WIDTH = 0.15
 SOFT_VIA_PUSH = math.inf  # mm a new via may push unlocked copper (router decides; 0.1 plans fewer, not better)
-# Smaller via allowed only inside a rule area (rule bga_fanout_vias in rocketkvm-v2.kicad_dru)
+# Smaller via allowed only inside these rule areas (rule bga_fanout_vias in rocketkvm-v2.kicad_dru)
 SMALL_VIA = (0.3, 0.15)
-SMALL_VIA_AREA = 'ESCAPE_TC'  # widest unlocked signal track we expect to push aside
+SMALL_VIA_AREAS = ['ESCAPE_TC', 'ESCAPE_P4']  # widest unlocked signal track we expect to push aside
 
 ITEM_RE = re.compile(r'^(Pad|Track|Via|Arc)\b.*?\[(?P<net>[^\]]+)\].*? on (?P<layers>[^,]+?)(,|$)')
 
@@ -129,7 +129,7 @@ def disc(grid, c, d):
 
 
 class Board:
-    def __init__(self, geom, pitch, locked_soft=False):
+    def __init__(self, geom, pitch, locked_soft=False, shove_pinned=False):
         self.geom = geom
         self.grid = g = Grid(geom, pitch)
         self.layers = geom['layers']
@@ -140,7 +140,7 @@ class Board:
 
         n = len(self.layers)
         items = []  # (layer, polygon px, net, hard, is_via, clearance)
-        pinned = pinned_stubs(geom)
+        pinned = set() if shove_pinned else pinned_stubs(geom)
         for k, t in enumerate(geom['tracks']):
             items.append((t['layer'], capsule(g, t['a'], t['b'], t['width']), t['net'],
                           (t['locked'] or k in pinned) and not locked_soft, False, t.get('clearance', 0)))
@@ -219,8 +219,9 @@ class Board:
         self.dist_keep_v = dist_to(np.asarray(keep_v, dtype=bool), pitch) - pitch
 
         small = Image.new('L', (g.w, g.h), 0)
-        for ring in self.areas.get(SMALL_VIA_AREA, []):
-            ImageDraw.Draw(small).polygon(ring, fill=1)
+        for area in SMALL_VIA_AREAS:
+            for ring in self.areas.get(area, []):
+                ImageDraw.Draw(small).polygon(ring, fill=1)
         # The whole via must sit inside the area for the rule to apply.
         self.dist_small_area = ndimage.distance_transform_edt(np.asarray(small, dtype=bool)) * pitch - pitch
 
@@ -457,13 +458,13 @@ def path_to_waypoints(board, box, path, L, H, W, allowed_names, via):
 
 PROFILES = [
     # name, soft penalty, 45 deg turn, 90 deg turn, via cost, soft via extra, outer layer cost, safety px,
-    # how far (mm) a new via may push unlocked copper
+    # how far (mm) a new via may push unlocked copper (None: --via-push)
     # Distances are measured to the nearest filled pixel centre, so the true edge can be up to
     # ~0.71 px closer: the sound profiles add that, the last one gambles on it (the router has the
     # final say, so an optimistic plan can only fail, never break a rule).
-    ('balanced', 4.0, 1.0, 4.0, 30.0, 40.0, 1.25, 1.01, SOFT_VIA_PUSH),
-    ('no_shove', 1e9, 1.0, 4.0, 30.0, 1e9, 1.25, 1.01, SOFT_VIA_PUSH),
-    ('via_happy', 2.0, 1.0, 4.0, 12.0, 20.0, 1.0, 1.01, SOFT_VIA_PUSH),
+    ('balanced', 4.0, 1.0, 4.0, 30.0, 40.0, 1.25, 1.01, None),
+    ('no_shove', 1e9, 1.0, 4.0, 30.0, 1e9, 1.25, 1.01, None),
+    ('via_happy', 2.0, 1.0, 4.0, 12.0, 20.0, 1.0, 1.01, None),
     ('optimistic', 4.0, 1.0, 4.0, 30.0, 40.0, 1.25, 0.3, math.inf),
 ]
 
@@ -481,7 +482,8 @@ def plan_gap(board, a, b, margin_mm):
     plans, notes = [], []
 
     for name, soft_pen, t45, t90, via_cost, via_soft, outer, safety_px, via_push in PROFILES:
-        track_all, via = board.net_rasters(net, box, safety_px * g.pitch, via_push)
+        track_all, via = board.net_rasters(net, box, safety_px * g.pitch,
+                                           SOFT_VIA_PUSH if via_push is None else via_push)
         track = np.ascontiguousarray(np.stack([track_all[board.li[n]] for n in names]))
         if soft_pen > 1e8:
             track[track == 2] = 0
@@ -516,7 +518,7 @@ def plan_gap(board, a, b, margin_mm):
 
 
 def main():
-    global SIGNAL_LAYERS, RAIL_LAYER, RAIL_NET
+    global SIGNAL_LAYERS, RAIL_LAYER, RAIL_NET, SMALL_VIA_AREAS, SOFT_VIA_PUSH
     ap = argparse.ArgumentParser()
     ap.add_argument('geometry')
     ap.add_argument('drc')
@@ -527,18 +529,25 @@ def main():
     ap.add_argument('--modes', default='shove,walkaround')
     # Diagnosis only: plans that need locked copper moved are not routable by pns_headless_route.
     ap.add_argument('--locked-soft', action='store_true')
+    ap.add_argument('--shove-pinned', action='store_true',
+                    help='let plans push short unlocked fan-out stubs tied to a pad (the router decides)')
+    ap.add_argument('--small-via-areas', default=','.join(SMALL_VIA_AREAS))
+    ap.add_argument('--via-push', type=float, default=SOFT_VIA_PUSH,
+                    help='mm a planned via may push unlocked copper (last profile: unlimited)')
     ap.add_argument('--signal-layers', default=','.join(SIGNAL_LAYERS))
     ap.add_argument('--rail-layer', default=RAIL_LAYER)
     ap.add_argument('--rail-nets', default=RAIL_NET.pattern, help='regex of nets allowed on --rail-layer')
     args = ap.parse_args()
 
     SIGNAL_LAYERS = args.signal_layers.split(',')
+    SMALL_VIA_AREAS = [a for a in args.small_via_areas.split(',') if a]
+    SOFT_VIA_PUSH = args.via_push
     RAIL_LAYER = args.rail_layer
     RAIL_NET = re.compile(args.rail_nets)
 
     t0 = time.time()
     geom = json.load(open(args.geometry))
-    board = Board(geom, args.pitch, args.locked_soft)
+    board = Board(geom, args.pitch, args.locked_soft, args.shove_pinned)
     print(f'rasterised {board.grid.w}x{board.grid.h}x{len(board.layers)} in {time.time() - t0:.1f}s',
           file=sys.stderr)
 
