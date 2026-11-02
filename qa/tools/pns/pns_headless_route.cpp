@@ -29,7 +29,9 @@
  *   { "net": "GND", "start": [x, y], "start_layer": "F.Cu",
  *     "waypoints": [ { "x": 1, "y": 2, "layer": "B.Cu", "via": true }, ... ],
  *     "end": [x, y] }
- * Coordinates are in mm.  A waypoint with "via" (or a "layer" different from the current
+ * Instead of "waypoints" a job may give "alternatives", a list of waypoint lists tried in order
+ * until one routes.  "modes" (default ["shove", "walkaround"]) sets the router modes tried, each
+ * over all plans.  Coordinates are in mm.  A waypoint with "via" (or a "layer" different from the current
  * one) places a through via at that point and continues on the other layer.
  * Results are written as JSON to stdout.
  */
@@ -62,6 +64,7 @@
 #include <wildcards_and_files_ext.h>
 
 #include <router/pns_arc.h>
+#include <router/pns_joint.h>
 #include <router/pns_kicad_iface.h>
 #include <router/pns_placement_algo.h>
 #include <router/pns_router.h>
@@ -322,6 +325,8 @@ public:
     }
 
     ROUTE_RESULT Route( const nlohmann::json& aJob );
+    ROUTE_RESULT RouteAlternatives( const nlohmann::json& aJob, int& aUsedPlan,
+                                   std::string& aUsedMode );
 
     HEADLESS_PNS_IFACE& Iface() { return *m_iface; }
 
@@ -413,8 +418,18 @@ PNS::ITEM* HEADLESS_ROUTER::findAnchor( const VECTOR2I& aP, NETINFO_ITEM* aNet, 
     {
         const SEG& seg = static_cast<PNS::SEGMENT*>( best )->Seg();
         int        halfWidth = static_cast<PNS::SEGMENT*>( best )->Width() / 2;
+        PNS::NODE* world = m_router->GetWorld();
+        auto       dangling = [&]( const VECTOR2I& aEnd )
+                              {
+                                  const PNS::JOINT* joint = world->FindJoint( aEnd, best );
+                                  return !joint || joint->LinkCount() <= 1;
+                              };
 
-        if( ( aP - seg.A ).EuclideanNorm() <= halfWidth )
+        // DRC reports a track by its start point, which may be the end already tied to a pad;
+        // continuing from the free end is what a ratsnest edge actually asks for.
+        if( dangling( seg.A ) != dangling( seg.B ) )
+            aSnap = dangling( seg.A ) ? seg.A : seg.B;
+        else if( ( aP - seg.A ).EuclideanNorm() <= halfWidth )
             aSnap = seg.A;
         else if( ( aP - seg.B ).EuclideanNorm() <= halfWidth )
             aSnap = seg.B;
@@ -440,6 +455,60 @@ ROUTE_RESULT HEADLESS_ROUTER::fail( const wxString& aReason )
 
     ROUTE_RESULT result;
     result.reason = aReason;
+    return result;
+}
+
+
+ROUTE_RESULT HEADLESS_ROUTER::RouteAlternatives( const nlohmann::json& aJob, int& aUsedPlan,
+                                                  std::string& aUsedMode )
+{
+    aUsedPlan = -1;
+    aUsedMode.clear();
+
+    nlohmann::json plans = aJob.contains( "alternatives" )
+                                   ? aJob.at( "alternatives" )
+                                   : nlohmann::json::array( { aJob.value( "waypoints",
+                                                                          nlohmann::json::array() ) } );
+    nlohmann::json modes = aJob.value( "modes", nlohmann::json::array( { "shove", "walkaround" } ) );
+
+    ROUTE_RESULT result;
+    wxString     reasons;
+
+    // A failed attempt is discarded by StopRouting(), so the next one starts from a clean world.
+    for( const nlohmann::json& mode : modes )
+    {
+        std::string modeName = mode.get<std::string>();
+
+        if( modeName == "walkaround" )
+            m_settings->SetMode( PNS::RM_Walkaround );
+        else if( modeName == "shove" )
+            m_settings->SetMode( PNS::RM_Shove );
+        else
+            throw std::invalid_argument( "unknown mode " + modeName );
+
+        for( size_t plan = 0; plan < plans.size(); plan++ )
+        {
+            nlohmann::json attempt = aJob;
+            attempt["waypoints"] = plans[plan];
+
+            result = Route( attempt );
+
+            if( result.ok )
+            {
+                aUsedPlan = (int) plan;
+                aUsedMode = modeName;
+                m_settings->SetMode( PNS::RM_Shove );
+                return result;
+            }
+
+            reasons += wxString::Format( wxT( "%s[%s %d] %s" ),
+                                         reasons.IsEmpty() ? wxT( "" ) : wxT( "; " ),
+                                         modeName.substr( 0, 1 ), (int) plan, result.reason );
+        }
+    }
+
+    m_settings->SetMode( PNS::RM_Shove );
+    result.reason = reasons;
     return result;
 }
 
@@ -533,7 +602,7 @@ ROUTE_RESULT HEADLESS_ROUTER::Route( const nlohmann::json& aJob )
         }
 
         if( placeVia && !m_router->SwitchLayer( targetLayer ) )
-            return fail( wxString::Format( wxT( "waypoint %d: layer switch failed" ), idx ) );
+            return fail( wxString::Format( wxT( "waypoint %d: no via could be placed there" ), idx ) );
 
         idx++;
     }
@@ -682,10 +751,12 @@ int main( int argc, char** argv )
             entry["net"] = job.value( "net", "" );
 
             ROUTE_RESULT res;
+            int          usedPlan = -1;
+            std::string  usedMode;
 
             try
             {
-                res = router.Route( job );
+                res = router.RouteAlternatives( job, usedPlan, usedMode );
             }
             catch( const std::exception& e )
             {
@@ -701,6 +772,9 @@ int main( int argc, char** argv )
                 entry["vias"] = after.vias - before.vias;
                 entry["shoved_updated"] = after.updated - before.updated;
                 entry["removed"] = after.removed - before.removed;
+
+                entry["plan"] = usedPlan;
+                entry["mode"] = usedMode;
                 routed++;
             }
             else
