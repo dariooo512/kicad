@@ -169,3 +169,42 @@ include_directories(
 )
 
 # kicad_add_boost_test( qa_pns_regressions qa_pns_regressions )
+
+# Link the kiface objects through an archive so only what the router uses is pulled in
+# (keeps OpenCASCADE and the exporters out of this console tool).
+add_library( pns_headless_route_kiface STATIC
+    $<TARGET_OBJECTS:pcbnew_kiface_objects>
+)
+
+target_link_libraries( pns_headless_route_kiface
+    PUBLIC
+        common
+        core
+        nlohmann_json
+        rectpack2d
+        gzip-hpp
+        nanoflann
+        Boost::boost
+        ZLIB::ZLIB
+)
+
+add_dependencies( pns_headless_route_kiface pcbnew_kiface_objects )
+
+add_executable( pns_headless_route
+    pns_headless_route.cpp
+)
+
+target_compile_definitions( pns_headless_route
+    PRIVATE PCBNEW
+)
+
+target_link_libraries( pns_headless_route
+    "$<LINK_GROUP:RESCAN,pns_headless_route_kiface,3d-viewer,connectivity,pcbcommon,pnsrouter,scripting,dxflib_qcad,tinyspline_lib,nanosvg,idf3,markdown_lib,common>"
+    gal
+    ${PCBNEW_IO_LIBRARIES}
+    ${wxWidgets_LIBRARIES}
+    ${GDI_PLUS_LIBRARIES}
+    ${PYTHON_LIBRARIES}
+    Boost::headers
+    ${PCBNEW_EXTRA_LIBS}    # -lrt must follow Boost
+)
