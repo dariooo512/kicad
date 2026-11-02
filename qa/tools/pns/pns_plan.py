@@ -451,6 +451,7 @@ def plan_gap(board, a, b, margin_mm):
 
 
 def main():
+    global SIGNAL_LAYERS, RAIL_LAYER, RAIL_NET
     ap = argparse.ArgumentParser()
     ap.add_argument('geometry')
     ap.add_argument('drc')
@@ -466,7 +467,6 @@ def main():
     ap.add_argument('--rail-nets', default=RAIL_NET.pattern, help='regex of nets allowed on --rail-layer')
     args = ap.parse_args()
 
-    global SIGNAL_LAYERS, RAIL_LAYER, RAIL_NET
     SIGNAL_LAYERS = args.signal_layers.split(',')
     RAIL_LAYER = args.rail_layer
     RAIL_NET = re.compile(args.rail_nets)
