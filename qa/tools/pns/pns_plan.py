@@ -35,7 +35,11 @@ SIGNAL_LAYERS = ['F.Cu', 'In2.Cu', 'In5.Cu', 'B.Cu']
 RAIL_LAYER = 'In4.Cu'
 RAIL_NET = re.compile(r'^\+3V3')
 OUTER_LAYERS = {'F.Cu', 'B.Cu'}
-SHOVED_WIDTH = 0.15  # widest unlocked signal track we expect to push aside
+SHOVED_WIDTH = 0.15
+SOFT_VIA_PUSH = math.inf  # mm a new via may push unlocked copper (router decides; 0.1 plans fewer, not better)
+# Smaller via allowed only inside a rule area (rule bga_fanout_vias in rocketkvm-v2.kicad_dru)
+SMALL_VIA = (0.3, 0.15)
+SMALL_VIA_AREA = 'ESCAPE_TC'  # widest unlocked signal track we expect to push aside
 
 ITEM_RE = re.compile(r'^(Pad|Track|Via|Arc)\b.*?\[(?P<net>[^\]]+)\].*? on (?P<layers>[^,]+?)(,|$)')
 
@@ -47,6 +51,40 @@ def dist_to(mask, pitch):
     if not mask.any():
         return np.full(mask.shape, np.inf)
     return ndimage.distance_transform_edt(~mask) * pitch
+
+
+PIN_STUB_MM = 1.0
+
+
+def pinned_stubs(geom):
+    """Indices of short tracks tied to a pad or via at one end: shoving cannot move them."""
+    anchors = {}
+    for p in geom['pads']:
+        for layer, poly in p['polys'].items():
+            for ring in poly['outlines']:
+                xs = [q[0] for q in ring]
+                ys = [q[1] for q in ring]
+                anchors.setdefault((p['net'], layer), []).append(('ring', ring, min(xs), min(ys), max(xs), max(ys)))
+    for v in geom['vias']:
+        for layer in v['layers']:
+            anchors.setdefault((v['net'], layer), []).append(('disc', v['pos'], v['diameter'] / 2))
+
+    def anchored(net, layer, pt):
+        for a in anchors.get((net, layer), []):
+            if a[0] == 'disc':
+                if math.dist(a[1], pt) <= a[2]:
+                    return True
+            elif a[2] <= pt[0] <= a[4] and a[3] <= pt[1] <= a[5] and point_in_ring(pt, a[1]):
+                return True
+        return False
+
+    out = set()
+    for k, t in enumerate(geom['tracks']):
+        if t['locked'] or math.dist(t['a'], t['b']) >= PIN_STUB_MM:
+            continue
+        if anchored(t['net'], t['layer'], t['a']) or anchored(t['net'], t['layer'], t['b']):
+            out.add(k)
+    return out
 
 
 class Grid:
@@ -102,9 +140,10 @@ class Board:
 
         n = len(self.layers)
         items = []  # (layer, polygon px, net, hard, is_via, clearance)
-        for t in geom['tracks']:
+        pinned = pinned_stubs(geom)
+        for k, t in enumerate(geom['tracks']):
             items.append((t['layer'], capsule(g, t['a'], t['b'], t['width']), t['net'],
-                          t['locked'] and not locked_soft, False, t.get('clearance', 0)))
+                          (t['locked'] or k in pinned) and not locked_soft, False, t.get('clearance', 0)))
         for v in geom['vias']:
             for layer in v['layers']:
                 items.append((layer, disc(g, v['pos'], v['diameter']), v['net'],
@@ -179,7 +218,13 @@ class Board:
         self.dist_keep_t = np.stack([dist_to(np.asarray(im, dtype=bool), pitch) - pitch for im in keep_t])
         self.dist_keep_v = dist_to(np.asarray(keep_v, dtype=bool), pitch) - pitch
 
-    def net_rasters(self, net, box, safety):
+        small = Image.new('L', (g.w, g.h), 0)
+        for ring in self.areas.get(SMALL_VIA_AREA, []):
+            ImageDraw.Draw(small).polygon(ring, fill=1)
+        # The whole via must sit inside the area for the rule to apply.
+        self.dist_small_area = ndimage.distance_transform_edt(np.asarray(small, dtype=bool)) * pitch - pitch
+
+    def net_rasters(self, net, box, safety, via_push=SOFT_VIA_PUSH):
         """Per-layer track state (0 blocked, 1 free, 2 crosses unlocked copper) and via state."""
         y0, y1, x0, x1 = box
         nid = self.netid[net]
@@ -195,8 +240,9 @@ class Board:
         # Crossing unlocked copper only helps where the shoved track has somewhere to go.
         shove_room = np.ones_like(hard_ok)
         soft_hit = np.zeros_like(hard_ok)
-        via_hard_ok = np.ones((y1 - y0, x1 - x0), dtype=bool)
-        via_soft_hit = np.zeros_like(via_hard_ok)
+        d_hard_min = np.full((y1 - y0, x1 - x0), np.inf)
+        d_fvia_min = np.full_like(d_hard_min, np.inf)
+        d_soft_min = np.full_like(d_hard_min, np.inf)
         for k, bucket in enumerate(self.buckets):
             c = max(clr, bucket)
             owner = self.owner[k][:, y0:y1, x0:x1]
@@ -210,9 +256,10 @@ class Board:
             hard_ok &= d_hard >= c + w / 2 + safety
             shove_room &= d_hard >= 2 * c + 1.5 * w + SHOVED_WIDTH + safety
             soft_hit |= d_soft < c + w / 2 + safety
-            v_need = c + vd / 2 + safety
-            via_hard_ok &= (d_hard.min(axis=0) >= v_need) & (d_fvia.min(axis=0) >= v_need)
-            via_soft_hit |= d_soft.min(axis=0) < v_need
+            # Store distances less the bucket clearance so one threshold serves every via size.
+            d_hard_min = np.minimum(d_hard_min, d_hard.min(axis=0) - c)
+            d_fvia_min = np.minimum(d_fvia_min, d_fvia.min(axis=0) - c)
+            d_soft_min = np.minimum(d_soft_min, d_soft.min(axis=0) - c)
         holes = self.hole_owner[y0:y1, x0:x1]
         d_fhole = dist_to((holes != 0) & (holes != nid), p)
 
@@ -222,13 +269,25 @@ class Board:
         track[(track == 1) & soft_hit] = 2
         track[(track == 2) & ~shove_room] = 0
 
-        via_ok = (via_hard_ok
-                  & (self.dist_keep_v[y0:y1, x0:x1] >= vd / 2 + safety)
-                  & (d_edge >= self.rules['edge_clearance'] + vd / 2 + safety)
-                  & (d_fhole >= self.rules['hole_clearance'] + vd / 2 + safety)
-                  & (d_hole >= self.rules['hole_to_hole'] + drill / 2 + safety))
-        via = via_ok.astype(np.uint8)
-        via[via_ok & via_soft_hit] = 2
+        def via_sites(diameter, hole):
+            need = diameter / 2 + safety
+            ok = ((d_hard_min >= need) & (d_fvia_min >= need)
+                  & (self.dist_keep_v[y0:y1, x0:x1] >= need)
+                  & (d_edge >= self.rules['edge_clearance'] + need)
+                  & (d_fhole >= self.rules['hole_clearance'] + need)
+                  & (d_hole >= self.rules['hole_to_hole'] + hole / 2 + safety))
+            sites = ok.astype(np.uint8)
+            sites[ok & (d_soft_min < need)] = 2
+            # A via only nudges unlocked copper; landing on it needs a push shoving rarely achieves.
+            sites[ok & (d_soft_min < need - via_push)] = 0
+            return sites
+
+        via = via_sites(vd, drill)
+        small = via_sites(*SMALL_VIA)
+        small[self.dist_small_area[y0:y1, x0:x1] < SMALL_VIA[0] / 2] = 0
+        # 0/1/2 as for tracks; 3/4 mean only the small via fits (free / over unlocked copper).
+        use_small = (via == 0) & (small > 0)
+        via[use_small] = small[use_small] + 2
         return track, via
 
 
@@ -297,6 +356,8 @@ def astar(track, via, allowed, lcost, starts, goals, soft_pen, t45, t90, via_cos
                 h = max(ax, ay) + 0.41421356 * min(ax, ay)
                 heapq.heappush(heap, (np.float32(cost + h), np.int64(ns)))
         vs = via[y, x]
+        if vs > 2:
+            vs -= 2
         if vs != 0:
             for nl in range(L):
                 if nl == l or not allowed[nl] or track[nl, y, x] == 0:
@@ -372,7 +433,7 @@ def point_in_ring(pt, ring):
     return inside
 
 
-def path_to_waypoints(board, box, path, L, H, W, allowed_names):
+def path_to_waypoints(board, box, path, L, H, W, allowed_names, via):
     pts = []
     for s in path:
         c = s // 9
@@ -383,8 +444,11 @@ def path_to_waypoints(board, box, path, L, H, W, allowed_names):
         l, y, x, d = pts[i]
         nl, ny, nx, nd = pts[i + 1]
         if nl != l:
-            wps.append({'x': board.grid.mm(y, x)[0], 'y': board.grid.mm(y, x)[1],
-                        'layer': allowed_names[nl], 'via': True})
+            wp = {'x': board.grid.mm(y, x)[0], 'y': board.grid.mm(y, x)[1],
+                  'layer': allowed_names[nl], 'via': True}
+            if via[y - box[0], x - box[2]] > 2:
+                wp['via_diameter'], wp['via_drill'] = SMALL_VIA
+            wps.append(wp)
         elif nd != d and d != 8:
             p = board.grid.mm(y, x)
             wps.append({'x': p[0], 'y': p[1]})
@@ -392,14 +456,15 @@ def path_to_waypoints(board, box, path, L, H, W, allowed_names):
 
 
 PROFILES = [
-    # name, soft penalty, 45 deg turn, 90 deg turn, via cost, soft via extra, outer layer cost, safety px
+    # name, soft penalty, 45 deg turn, 90 deg turn, via cost, soft via extra, outer layer cost, safety px,
+    # how far (mm) a new via may push unlocked copper
     # Distances are measured to the nearest filled pixel centre, so the true edge can be up to
     # ~0.71 px closer: the sound profiles add that, the last one gambles on it (the router has the
     # final say, so an optimistic plan can only fail, never break a rule).
-    ('balanced', 4.0, 1.0, 4.0, 30.0, 40.0, 1.25, 1.01),
-    ('no_shove', 1e9, 1.0, 4.0, 30.0, 1e9, 1.25, 1.01),
-    ('via_happy', 2.0, 1.0, 4.0, 12.0, 20.0, 1.0, 1.01),
-    ('optimistic', 4.0, 1.0, 4.0, 30.0, 40.0, 1.25, 0.3),
+    ('balanced', 4.0, 1.0, 4.0, 30.0, 40.0, 1.25, 1.01, SOFT_VIA_PUSH),
+    ('no_shove', 1e9, 1.0, 4.0, 30.0, 1e9, 1.25, 1.01, SOFT_VIA_PUSH),
+    ('via_happy', 2.0, 1.0, 4.0, 12.0, 20.0, 1.0, 1.01, SOFT_VIA_PUSH),
+    ('optimistic', 4.0, 1.0, 4.0, 30.0, 40.0, 1.25, 0.3, math.inf),
 ]
 
 
@@ -415,12 +480,12 @@ def plan_gap(board, a, b, margin_mm):
            max(0, min(ax, bx) - m), min(g.w, max(ax, bx) + m + 1))
     plans, notes = [], []
 
-    for name, soft_pen, t45, t90, via_cost, via_soft, outer, safety_px in PROFILES:
-        track_all, via = board.net_rasters(net, box, safety_px * g.pitch)
+    for name, soft_pen, t45, t90, via_cost, via_soft, outer, safety_px, via_push in PROFILES:
+        track_all, via = board.net_rasters(net, box, safety_px * g.pitch, via_push)
         track = np.ascontiguousarray(np.stack([track_all[board.li[n]] for n in names]))
         if soft_pen > 1e8:
             track[track == 2] = 0
-            via[via == 2] = 0
+            via[(via == 2) | (via == 4)] = 0
         lcost = np.array([outer if n in OUTER_LAYERS else 1.0 for n in names], dtype=np.float64)
         allowed = np.ones(len(names), dtype=np.bool_)
         starts = np.array([(names.index(l), ay - box[0], ax - box[2]) for l in a['layers'] if l in names],
@@ -442,7 +507,7 @@ def plan_gap(board, a, b, margin_mm):
             notes.append(f'{name}: no path')
             continue
         wps, last_layer = path_to_waypoints(board, box, np.array(path), len(names), box[1] - box[0],
-                                            box[3] - box[2], names)
+                                            box[3] - box[2], names, via)
         start_layer = names[(path[0] // 9) // ((box[1] - box[0]) * (box[3] - box[2]))]
         plan = {'start_layer': start_layer, 'waypoints': wps}
         if plan not in plans:

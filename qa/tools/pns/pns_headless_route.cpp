@@ -33,19 +33,30 @@
  * a waypoint list or { "start_layer": ..., "waypoints": [...] }.  "modes" (default
  * ["shove", "walkaround"]) sets the router modes tried, each over all plans.  Coordinates are in
  * mm.  A waypoint with "via" (or a "layer" different from the current one) places a through via
- * at that point and continues on the other layer.
+ * at that point and continues on the other layer; "via_diameter"/"via_drill" (mm) override the
+ * net class via size for that via.
  * Results are written as JSON to stdout.
  *
  *   pns_headless_route --dump board.kicad_pcb geometry.json
  *
  * writes the copper geometry, net classes and rule areas for an external path planner.
+ *
+ * A job { "net": "GND", "stitch": [x, y] } adds a through via of the net's class size there.
+ *
+ * --unlock-noncritical lets the router shove locked tracks and vias except critical copper:
+ * nets in --critical-classes or matching --critical-nets, and --return-net vias within
+ * --return-via-radius mm of their vias.  Unlocked items are locked again in the output.
  */
 
 #include <cstdio>
+#include <cstring>
+#include <sstream>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <regex>
+#include <set>
 
 #include <wx/app.h>
 #include <wx/filename.h>
@@ -115,6 +126,100 @@ struct HEADLESS_PGM : public PGM_BASE
 };
 
 
+struct UNLOCK_OPTIONS
+{
+    bool                  enabled = false;
+    std::set<std::string> classes = { "Diff100", "Diff90", "SE50" };
+    std::string           netPattern;
+    std::string           returnNet = "GND";
+    double                returnViaRadiusMm = 0.6;
+};
+
+static UNLOCK_OPTIONS s_unlock;
+
+
+static bool isCriticalNet( NETINFO_ITEM* aNet )
+{
+    if( !aNet || aNet->GetNetCode() <= 0 )
+        return false;
+
+    if( NETCLASS* nc = aNet->GetNetClass() )
+    {
+        for( const wxString& part : wxSplit( nc->GetName(), ',' ) )
+        {
+            if( s_unlock.classes.count( part.ToStdString( wxConvUTF8 ) ) )
+                return true;
+        }
+    }
+
+    return !s_unlock.netPattern.empty()
+           && std::regex_search( aNet->GetNetname().ToStdString( wxConvUTF8 ),
+                                 std::regex( s_unlock.netPattern ) );
+}
+
+
+/**
+ * Copper that must never move: critical nets, plus return vias hugging their vias.
+ */
+static std::set<BOARD_ITEM*> criticalCopper( BOARD* aBoard )
+{
+    std::set<BOARD_ITEM*> critical;
+    std::vector<VECTOR2I> criticalVias;
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        if( !isCriticalNet( track->GetNet() ) )
+            continue;
+
+        critical.insert( track );
+
+        if( track->Type() == PCB_VIA_T )
+            criticalVias.push_back( track->GetPosition() );
+    }
+
+    const double radius = pcbIUScale.mmToIU( s_unlock.returnViaRadiusMm );
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        if( track->Type() != PCB_VIA_T || track->GetNetname() != wxString::FromUTF8( s_unlock.returnNet ) )
+            continue;
+
+        for( const VECTOR2I& pos : criticalVias )
+        {
+            if( ( track->GetPosition() - pos ).EuclideanNorm() <= radius )
+            {
+                critical.insert( track );
+                break;
+            }
+        }
+    }
+
+    return critical;
+}
+
+
+/**
+ * Unlock locked tracks and vias that are not critical so the router may shove them.  Returns
+ * what was unlocked, to be locked again before saving.
+ */
+static std::set<BOARD_ITEM*> unlockNonCritical( BOARD* aBoard )
+{
+    std::set<BOARD_ITEM*> critical = criticalCopper( aBoard );
+    std::set<BOARD_ITEM*> unlocked;
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        if( track->IsLocked() && !critical.count( track ) )
+        {
+            track->SetLocked( false );
+            unlocked.insert( track );
+        }
+    }
+
+    return unlocked;
+}
+
+
 /**
  * Router interface that applies committed routes straight to the BOARD, without a view
  * or a BOARD_COMMIT (which needs a tool manager).
@@ -145,6 +250,11 @@ public:
     }
 
     STATS m_stats;
+
+    // Items unlocked for routing, and what to lock again before saving: the survivors plus the
+    // pieces that replace a shoved one (the router removes the original before adding those).
+    std::set<BOARD_ITEM*> m_unlocked;
+    std::set<BOARD_ITEM*> m_relock;
 
 private:
     void applyVia( PCB_VIA* aBoardVia, PNS::VIA* aVia );
@@ -241,6 +351,9 @@ void HEADLESS_PNS_IFACE::AddItem( PNS::ITEM* aItem )
     if( aItem->IsLocked() )
         newItem->SetLocked( true );
 
+    if( m_unlocked.count( aItem->GetSourceItem() ) || m_relock.count( aItem->GetSourceItem() ) )
+        m_relock.insert( newItem );
+
     aItem->SetParent( newItem );
     m_board->Add( newItem, ADD_MODE::APPEND, true );
     m_stats.added++;
@@ -297,6 +410,7 @@ void HEADLESS_PNS_IFACE::RemoveItem( PNS::ITEM* aItem )
         return;
 
     m_board->Remove( parent );
+    m_relock.erase( parent );
     m_graveyard.emplace_back( parent );
     m_stats.removed++;
 }
@@ -606,7 +720,9 @@ ROUTE_RESULT HEADLESS_ROUTER::Route( const nlohmann::json& aJob )
     if( !m_router->StartRouting( startPos, startItem, pnsLayer ) )
         return fail( wxT( "start failed: " ) + m_router->FailureReason() );
 
-    int idx = 0;
+    const int defaultViaDiameter = sizes.ViaDiameter();
+    const int defaultViaDrill = sizes.ViaDrill();
+    int       idx = 0;
 
     for( const nlohmann::json& wp : aJob.value( "waypoints", nlohmann::json::array() ) )
     {
@@ -636,6 +752,14 @@ ROUTE_RESULT HEADLESS_ROUTER::Route( const nlohmann::json& aJob )
         {
             PNS::SIZES_SETTINGS viaSizes( m_router->Sizes() );
             viaSizes.SetViaType( VIATYPE::THROUGH );
+
+            // A waypoint may ask for a smaller via where a rule area allows one.
+            viaSizes.SetViaDiameter( wp.contains( "via_diameter" )
+                                             ? pcbIUScale.mmToIU( wp.at( "via_diameter" ).get<double>() )
+                                             : defaultViaDiameter );
+            viaSizes.SetViaDrill( wp.contains( "via_drill" )
+                                          ? pcbIUScale.mmToIU( wp.at( "via_drill" ).get<double>() )
+                                          : defaultViaDrill );
             viaSizes.ClearLayerPairs();
             viaSizes.AddLayerPair( curLayer, targetLayer );
             m_router->UpdateSizes( viaSizes );
@@ -868,8 +992,9 @@ static void dumpBoard( BOARD* aBoard, const std::string& aPath )
     if( aBoard->GetBoardPolygonOutlines( outline, true ) )
         out["outline"] = polySetToJson( outline );
 
-    nlohmann::json tracks = nlohmann::json::array();
-    nlohmann::json vias = nlohmann::json::array();
+    nlohmann::json        tracks = nlohmann::json::array();
+    nlohmann::json        vias = nlohmann::json::array();
+    std::set<BOARD_ITEM*> critical = criticalCopper( aBoard );
 
     for( PCB_TRACK* track : aBoard->Tracks() )
     {
@@ -885,6 +1010,8 @@ static void dumpBoard( BOARD* aBoard, const std::string& aPath )
                               { "drill", pcbIUScale.IUTomm( via->GetDrillValue() ) },
                               { "layers", copperLayersToJson( aBoard, via->GetLayerSet() ) },
                               { "locked", via->IsLocked() },
+                              { "uuid", via->m_Uuid.AsStdString() },
+                              { "critical", critical.count( via ) > 0 },
                               { "clearance", clearanceToTrack( aBoard, via, top ) } } );
             continue;
         }
@@ -915,6 +1042,8 @@ static void dumpBoard( BOARD* aBoard, const std::string& aPath )
                                 { "b", pointToJson( b ) },
                                 { "width", pcbIUScale.IUTomm( track->GetWidth() ) },
                                 { "locked", track->IsLocked() },
+                                { "uuid", track->m_Uuid.AsStdString() },
+                                { "critical", critical.count( track ) > 0 },
                                 { "clearance", clearance } } );
         }
     }
@@ -1002,22 +1131,59 @@ static void reportFatal( const std::string& aMessage )
 }
 
 
+static std::set<std::string> splitList( const std::string& aList )
+{
+    std::set<std::string> out;
+    std::stringstream     ss( aList );
+
+    for( std::string item; std::getline( ss, item, ',' ); )
+    {
+        if( !item.empty() )
+            out.insert( item );
+    }
+
+    return out;
+}
+
+
 int main( int argc, char** argv )
 {
-    bool dumpOnly = argc == 4 && std::string( argv[1] ) == "--dump";
+    std::vector<char*> args = { argv[0] };
+    bool               dumpOnly = false;
 
-    if( argc != 4 )
+    for( int i = 1; i < argc; i++ )
     {
-        std::cerr << "usage: pns_headless_route board.kicad_pcb jobs.json out.kicad_pcb\n"
-                     "       pns_headless_route --dump board.kicad_pcb geometry.json\n";
+        std::string arg( argv[i] );
+        auto        value = [&]( const char* aKey ) { return arg.substr( strlen( aKey ) ); };
+
+        if( arg == "--dump" )
+            dumpOnly = true;
+        else if( arg == "--unlock-noncritical" )
+            s_unlock.enabled = true;
+        else if( arg.rfind( "--critical-classes=", 0 ) == 0 )
+            s_unlock.classes = splitList( value( "--critical-classes=" ) );
+        else if( arg.rfind( "--critical-nets=", 0 ) == 0 )
+            s_unlock.netPattern = value( "--critical-nets=" );
+        else if( arg.rfind( "--return-net=", 0 ) == 0 )
+            s_unlock.returnNet = value( "--return-net=" );
+        else if( arg.rfind( "--return-via-radius=", 0 ) == 0 )
+            s_unlock.returnViaRadiusMm = std::stod( value( "--return-via-radius=" ) );
+        else
+            args.push_back( argv[i] );
+    }
+
+    if( args.size() != ( dumpOnly ? 3u : 4u ) )
+    {
+        std::cerr << "usage: pns_headless_route [options] board.kicad_pcb jobs.json out.kicad_pcb\n"
+                     "       pns_headless_route [options] --dump board.kicad_pcb geometry.json\n"
+                     "options: --unlock-noncritical  --critical-classes=Diff100,Diff90,SE50\n"
+                     "         --critical-nets=REGEX  --return-net=GND  --return-via-radius=0.6\n";
         return 2;
     }
 
-    if( dumpOnly )
-    {
-        argv++;
-        argc--;
-    }
+    argc = (int) args.size();
+    args.push_back( nullptr );
+    argv = args.data();
 
     // Keep this build's settings away from an installed KiCad of the same version.
     wxString configHome;
@@ -1108,6 +1274,11 @@ int main( int argc, char** argv )
         return 1;
     }
 
+    std::set<BOARD_ITEM*> unlocked;
+
+    if( s_unlock.enabled )
+        unlocked = unlockNonCritical( board.get() );
+
     if( dumpOnly )
     {
         dumpBoard( board.get(), argv[2] );
@@ -1119,10 +1290,15 @@ int main( int argc, char** argv )
 
     {
         HEADLESS_ROUTER router( board.get() );
+        router.Iface().m_unlocked = unlocked;
+        router.Iface().m_relock = unlocked;
 
         for( size_t i = 0; i < jobs.size(); i++ )
         {
             const nlohmann::json& job = jobs[i];
+
+            if( job.contains( "stitch" ) )
+                continue;
             nlohmann::json        entry;
             HEADLESS_PNS_IFACE::STATS before = router.Iface().m_stats;
 
@@ -1164,6 +1340,42 @@ int main( int argc, char** argv )
 
             results.push_back( entry );
         }
+
+        for( BOARD_ITEM* item : router.Iface().m_relock )
+            item->SetLocked( true );
+    }
+
+    // Stitching vias go in after routing, outside the router's world; DRC judges them afterwards.
+    for( size_t i = 0; i < jobs.size(); i++ )
+    {
+        const nlohmann::json& job = jobs[i];
+
+        if( !job.contains( "stitch" ) )
+            continue;
+
+        nlohmann::json entry = { { "index", i }, { "net", job.value( "net", "" ) } };
+        NETINFO_ITEM*  net = board->FindNet( wxString::FromUTF8( job.value( "net", "" ) ) );
+
+        if( !net || net->GetNetCode() <= 0 )
+        {
+            entry["status"] = "failed";
+            entry["reason"] = "unknown net";
+        }
+        else
+        {
+            PCB_VIA* via = new PCB_VIA( board.get() );
+            via->SetViaType( VIATYPE::THROUGH );
+            via->SetLayerPair( F_Cu, B_Cu );
+            via->SetPosition( pointFromJson( job.at( "stitch" ) ) );
+            via->SetWidth( PADSTACK::ALL_LAYERS, net->GetNetClass()->GetViaDiameter() );
+            via->SetDrill( net->GetNetClass()->GetViaDrill() );
+            via->SetNet( net );
+            board->Add( via, ADD_MODE::APPEND, true );
+            entry["status"] = "routed";
+            routed++;
+        }
+
+        results.push_back( entry );
     }
 
     board->BuildConnectivity();
