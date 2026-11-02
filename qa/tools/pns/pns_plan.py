@@ -526,6 +526,7 @@ def main():
     ap.add_argument('--pitch', type=float, default=0.05)
     ap.add_argument('--margin', type=float, default=4.0)
     ap.add_argument('--only', default='')
+    ap.add_argument('--nets', default='', help='regex: plan only gaps of matching nets')
     ap.add_argument('--modes', default='shove,walkaround')
     # Diagnosis only: plans that need locked copper moved are not routable by pns_headless_route.
     ap.add_argument('--locked-soft', action='store_true')
@@ -553,6 +554,7 @@ def main():
 
     drc = json.load(open(args.drc, encoding='utf-8'))
     only = set(filter(None, args.only.split(',')))
+    net_filter = re.compile(args.nets) if args.nets else None
     jobs, report = [], []
     for gap in drc['unconnected_items']:
         items = [parse_item(board, i) for i in gap['items'][:2]]
@@ -562,6 +564,8 @@ def main():
             continue
         a, b = sorted(items, key=lambda it: len(it['layers']))
         if only and a['net'] not in only:
+            continue
+        if net_filter and not net_filter.search(a['net']):
             continue
         t1 = time.time()
         plans, notes = plan_gap(board, a, b, args.margin)

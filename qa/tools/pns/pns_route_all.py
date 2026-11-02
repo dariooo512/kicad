@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Route a board's unconnected gaps in rounds: DRC -> dump -> plan -> route.
 
-usage: pns_route_all.py board.kicad_pcb workdir [--rounds 4]
+usage: pns_route_all.py board.kicad_pcb workdir [--rounds 4] [--nets REGEX] [--lock-nets REGEX] [...]
 
-A round's result is kept only if, after a zone refill, DRC shows no errors, no violation type
-the original board did not have, no more high-speed rule violations (skew, uncoupled length, via
-count, length, pair gap) or dangling tracks/vias than before, no extra zone-to-zone gaps (a new track can cut a pour into
-islands), and critical copper (see pns_headless_route --unlock-noncritical) is byte-identical.
-Afterwards a stitching via is tried for each GND pour island that is cut off from the main pour,
-where it overlaps the main pour on another layer and a via fits cleanly.  Otherwise each routed job is replayed alone to find the culprits, which are dropped
-and never planned again.
+A round's result is kept only if, after a zone refill, DRC shows no more errors (per type) than the
+input board, no violation type the input did not have, no more high-speed violations (skew,
+uncoupled length, via count, length, pair gap) or dangling tracks/vias, no extra zone-to-zone gaps
+(a new track can cut a pour into islands), and critical copper (see pns_headless_route
+--unlock-noncritical) is byte-identical.  Otherwise each routed job is replayed alone to find the
+plans that do the damage; those are dropped and the job tries its other plans.  Routes that pass
+alone but not together are added one at a time.
+
+Afterwards a stitching via is tried for each GND pour island cut off from the main pour, where it
+overlaps the main pour on another layer and a via fits cleanly.
 
 Environment: PNS_TOOL (pns_headless_route), KICAD_CLI (a Windows kicad-cli.exe works from WSL),
 PYTHON (interpreter for pns_plan.py, with numpy, scipy, pillow and ideally numba).
@@ -103,6 +106,7 @@ class Baseline:
     def __init__(self, drc, pcb, geom):
         self.types = {v['type'] for v in drc['violations']}
         self.counts = Counter(v['type'] for v in drc['violations'])
+        self.errors = Counter(v['type'] for v in drc['violations'] if v['severity'] == 'error')
         self.zone_gaps = zone_gaps(drc)
         self.critical = {x['uuid'] for k in ('tracks', 'vias') for x in geom[k] if x.get('critical')}
         self.critical_blocks = copper_blocks(pcb, self.critical)
@@ -110,12 +114,14 @@ class Baseline:
 
 def health(drc, base, pcb):
     """Why a refilled DRC report (and its board) is worse than the original, or None."""
-    errors = sum(v['severity'] == 'error' for v in drc['violations'])
+    # Mid-pipeline boards may already carry errors later steps clear: only growth counts.
+    errors = Counter(v['type'] for v in drc['violations'] if v['severity'] == 'error')
+    more_errors = {t: n for t, n in errors.items() if n > base.errors[t]}
     counts = Counter(v['type'] for v in drc['violations'])
     new_types = set(counts) - base.types
     worse = {t: counts[t] for t in NO_GROWTH_TYPES if counts[t] > base.counts[t]}
-    if errors:
-        return f'{errors} DRC errors'
+    if more_errors:
+        return f'more DRC errors {more_errors}'
     if new_types:
         return f'new violation types {sorted(new_types)}'
     if worse:
@@ -281,6 +287,8 @@ def main():
     ap.add_argument('--critical-nets', default='', help='regex of extra critical net names')
     ap.add_argument('--no-stitch', action='store_true', help='do not try stitching vias for stray GND islands')
     ap.add_argument('--plan-arg', action='append', default=[], help='extra pns_plan.py option (repeatable)')
+    ap.add_argument('--nets', default='', help='regex: route only gaps of matching nets')
+    ap.add_argument('--lock-nets', default='', help='regex: lock the copper of these nets in the final board')
     args = ap.parse_args()
 
     TOOL_ARGS.extend([f'--critical-classes={args.critical_classes}'])
@@ -288,6 +296,8 @@ def main():
         TOOL_ARGS.append(f'--critical-nets={args.critical_nets}')
     if args.unlock_noncritical:
         TOOL_ARGS.append('--unlock-noncritical')
+    if args.nets:
+        args.plan_arg.append(f'--nets={args.nets}')
 
     wd = Workdir(args.board, args.workdir)
     wd.stage(args.board, 'r0')
@@ -381,6 +391,14 @@ def main():
 
     if not args.no_stitch:
         current, current_drc = stitch_islands(wd, current, baseline, current_drc)
+
+    if args.lock_nets:
+        empty = wd.dir / 'lock.jobs.json'
+        json.dump([], open(empty, 'w'))
+        wd.stage(wd.dir / f'{current}.kicad_pcb', 'locked')
+        subprocess.run([TOOL, *TOOL_ARGS, f'--lock-nets={args.lock_nets}', str(wd.dir / f'{current}.kicad_pcb'),
+                        str(empty), str(wd.dir / 'locked.kicad_pcb')], check=True, stdout=subprocess.DEVNULL)
+        current = 'locked'
 
     shutil.copyfile(wd.dir / f'{current}.kicad_pcb', wd.dir / 'final.kicad_pcb')
     summary = {'final': str(wd.dir / 'final.kicad_pcb'), 'from_round': current,

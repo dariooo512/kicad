@@ -46,6 +46,7 @@
  * --unlock-noncritical lets the router shove locked tracks and vias except critical copper:
  * nets in --critical-classes or matching --critical-nets, and --return-net vias within
  * --return-via-radius mm of their vias.  Unlocked items are locked again in the output.
+ * --lock-nets=REGEX locks every track and via of the matching nets before saving.
  */
 
 #include <cstdio>
@@ -133,6 +134,7 @@ struct UNLOCK_OPTIONS
     std::string           netPattern;
     std::string           returnNet = "GND";
     double                returnViaRadiusMm = 0.6;
+    std::string           lockNets;          // regex: lock these nets' tracks and vias in the output
 };
 
 static UNLOCK_OPTIONS s_unlock;
@@ -1168,6 +1170,8 @@ int main( int argc, char** argv )
             s_unlock.returnNet = value( "--return-net=" );
         else if( arg.rfind( "--return-via-radius=", 0 ) == 0 )
             s_unlock.returnViaRadiusMm = std::stod( value( "--return-via-radius=" ) );
+        else if( arg.rfind( "--lock-nets=", 0 ) == 0 )
+            s_unlock.lockNets = value( "--lock-nets=" );
         else
             args.push_back( argv[i] );
     }
@@ -1177,7 +1181,8 @@ int main( int argc, char** argv )
         std::cerr << "usage: pns_headless_route [options] board.kicad_pcb jobs.json out.kicad_pcb\n"
                      "       pns_headless_route [options] --dump board.kicad_pcb geometry.json\n"
                      "options: --unlock-noncritical  --critical-classes=Diff100,Diff90,SE50\n"
-                     "         --critical-nets=REGEX  --return-net=GND  --return-via-radius=0.6\n";
+                     "         --critical-nets=REGEX  --return-net=GND  --return-via-radius=0.6\n"
+                     "         --lock-nets=REGEX (lock those nets' tracks and vias before saving)\n";
         return 2;
     }
 
@@ -1376,6 +1381,17 @@ int main( int argc, char** argv )
         }
 
         results.push_back( entry );
+    }
+
+    if( !s_unlock.lockNets.empty() )
+    {
+        std::regex lockRe( s_unlock.lockNets );
+
+        for( PCB_TRACK* track : board->Tracks() )
+        {
+            if( std::regex_search( track->GetNetname().ToStdString( wxConvUTF8 ), lockRe ) )
+                track->SetLocked( true );
+        }
     }
 
     board->BuildConnectivity();
