@@ -29,11 +29,16 @@
  *   { "net": "GND", "start": [x, y], "start_layer": "F.Cu",
  *     "waypoints": [ { "x": 1, "y": 2, "layer": "B.Cu", "via": true }, ... ],
  *     "end": [x, y] }
- * Instead of "waypoints" a job may give "alternatives", a list of waypoint lists tried in order
- * until one routes.  "modes" (default ["shove", "walkaround"]) sets the router modes tried, each
- * over all plans.  Coordinates are in mm.  A waypoint with "via" (or a "layer" different from the current
- * one) places a through via at that point and continues on the other layer.
+ * Instead of "waypoints" a job may give "alternatives", tried in order until one routes; each is
+ * a waypoint list or { "start_layer": ..., "waypoints": [...] }.  "modes" (default
+ * ["shove", "walkaround"]) sets the router modes tried, each over all plans.  Coordinates are in
+ * mm.  A waypoint with "via" (or a "layer" different from the current one) places a through via
+ * at that point and continues on the other layer.
  * Results are written as JSON to stdout.
+ *
+ *   pns_headless_route --dump board.kicad_pcb geometry.json
+ *
+ * writes the copper geometry, net classes and rule areas for an external path planner.
  */
 
 #include <cstdio>
@@ -55,7 +60,13 @@
 #include <drc/drc_engine.h>
 #include <kiface_base.h>
 #include <netinfo.h>
+#include <footprint.h>
 #include <pad.h>
+#include <pcb_shape.h>
+#include <zone.h>
+#include <layer_range.h>
+#include <geometry/shape_arc.h>
+#include <geometry/shape_segment.h>
 #include <pcb_io/pcb_io_mgr.h>
 #include <pcb_track.h>
 #include <pcbnew_settings.h>
@@ -291,10 +302,32 @@ void HEADLESS_PNS_IFACE::RemoveItem( PNS::ITEM* aItem )
 }
 
 
+/**
+ * Track width for @a aNet given the resolved width constraint.  Loaded headless, the implicit
+ * net class width rules resolve to one class for every net (the rule even names the wrong
+ * parent), so a width coming from an implicit net class rule is replaced by the net's own net
+ * class width; explicit custom rules are kept.
+ */
+static int netClassTrackWidth( const BOARD_DESIGN_SETTINGS& aBds, NETINFO_ITEM* aNet,
+                               const DRC_CONSTRAINT& aConstraint )
+{
+    NETCLASS* nc = aNet ? aNet->GetNetClass() : nullptr;
+    bool implicit = aConstraint.IsNull() || !aConstraint.GetParentRule()
+                    || aConstraint.GetParentRule()->IsImplicit();
+
+    if( nc && nc->HasTrackWidth() && implicit )
+        return std::max( aBds.m_TrackMinWidth, nc->GetTrackWidth() );
+
+    return aConstraint.IsNull() ? aBds.m_TrackMinWidth
+                                : std::max( aBds.m_TrackMinWidth, aConstraint.GetValue().Opt() );
+}
+
+
 struct ROUTE_RESULT
 {
-    bool     ok = false;
-    wxString reason;
+    bool           ok = false;
+    wxString       reason;
+    nlohmann::json sizes;
 };
 
 
@@ -329,6 +362,7 @@ public:
                                    std::string& aUsedMode );
 
     HEADLESS_PNS_IFACE& Iface() { return *m_iface; }
+    const nlohmann::json& LastSizes() const { return m_lastSizes; }
 
 private:
     PNS::ITEM* findAnchor( const VECTOR2I& aP, NETINFO_ITEM* aNet, int aPnsLayer, VECTOR2I& aSnap );
@@ -340,6 +374,7 @@ private:
     std::unique_ptr<HEADLESS_PNS_IFACE>     m_iface; // must outlive m_router
     std::unique_ptr<PNS::ROUTER>            m_router;
     std::unique_ptr<PNS::ROUTING_SETTINGS>  m_settings;
+    nlohmann::json                          m_lastSizes;
 };
 
 
@@ -489,7 +524,19 @@ ROUTE_RESULT HEADLESS_ROUTER::RouteAlternatives( const nlohmann::json& aJob, int
         for( size_t plan = 0; plan < plans.size(); plan++ )
         {
             nlohmann::json attempt = aJob;
-            attempt["waypoints"] = plans[plan];
+            const nlohmann::json& alt = plans[plan];
+
+            if( alt.is_object() )
+            {
+                attempt["waypoints"] = alt.value( "waypoints", nlohmann::json::array() );
+
+                if( alt.contains( "start_layer" ) )
+                    attempt["start_layer"] = alt.at( "start_layer" );
+            }
+            else
+            {
+                attempt["waypoints"] = alt;
+            }
 
             result = Route( attempt );
 
@@ -540,7 +587,21 @@ ROUTE_RESULT HEADLESS_ROUTER::Route( const nlohmann::json& aJob )
     sizes.ClearLayerPairs();
     sizes.AddLayerPair( m_iface->GetPNSLayerFromBoardLayer( F_Cu ),
                         m_iface->GetPNSLayerFromBoardLayer( B_Cu ) );
+    {
+        PCB_TRACK probe( m_board );
+        probe.SetLayer( *startLayer );
+        probe.SetNet( net );
+
+        DRC_CONSTRAINT width = m_board->GetDesignSettings().m_DRCEngine->EvalRules(
+                TRACK_WIDTH_CONSTRAINT, &probe, nullptr, *startLayer );
+        sizes.SetTrackWidth( netClassTrackWidth( m_board->GetDesignSettings(), net, width ) );
+    }
+
     m_router->UpdateSizes( sizes );
+    m_lastSizes = { { "track", pcbIUScale.IUTomm( sizes.TrackWidth() ) },
+                    { "clearance", pcbIUScale.IUTomm( sizes.Clearance() ) },
+                    { "via_diameter", pcbIUScale.IUTomm( sizes.ViaDiameter() ) },
+                    { "via_drill", pcbIUScale.IUTomm( sizes.ViaDrill() ) } };
 
     if( !m_router->StartRouting( startPos, startItem, pnsLayer ) )
         return fail( wxT( "start failed: " ) + m_router->FailureReason() );
@@ -634,6 +695,305 @@ ROUTE_RESULT HEADLESS_ROUTER::Route( const nlohmann::json& aJob )
 }
 
 
+static nlohmann::json pointToJson( const VECTOR2I& aP )
+{
+    return nlohmann::json::array( { pcbIUScale.IUTomm( aP.x ), pcbIUScale.IUTomm( aP.y ) } );
+}
+
+
+static nlohmann::json chainToJson( const SHAPE_LINE_CHAIN& aChain )
+{
+    nlohmann::json ring = nlohmann::json::array();
+
+    for( const VECTOR2I& pt : aChain.CPoints() )
+        ring.push_back( pointToJson( pt ) );
+
+    return ring;
+}
+
+
+static nlohmann::json polySetToJson( const SHAPE_POLY_SET& aPoly )
+{
+    nlohmann::json outlines = nlohmann::json::array();
+    nlohmann::json holes = nlohmann::json::array();
+
+    for( int i = 0; i < aPoly.OutlineCount(); i++ )
+    {
+        outlines.push_back( chainToJson( aPoly.COutline( i ) ) );
+
+        for( int h = 0; h < aPoly.HoleCount( i ); h++ )
+            holes.push_back( chainToJson( aPoly.CHole( i, h ) ) );
+    }
+
+    return { { "outlines", outlines }, { "holes", holes } };
+}
+
+
+static std::string layerName( BOARD* aBoard, PCB_LAYER_ID aLayer )
+{
+    return aBoard->GetLayerName( aLayer ).ToStdString( wxConvUTF8 );
+}
+
+
+static nlohmann::json copperLayersToJson( BOARD* aBoard, const LSET& aLayers )
+{
+    nlohmann::json out = nlohmann::json::array();
+
+    for( PCB_LAYER_ID layer : LAYER_RANGE( F_Cu, B_Cu, aBoard->GetCopperLayerCount() ) )
+    {
+        if( aLayers.Contains( layer ) )
+            out.push_back( layerName( aBoard, layer ) );
+    }
+
+    return out;
+}
+
+
+static std::string netName( const BOARD_CONNECTED_ITEM* aItem )
+{
+    return aItem->GetNetCode() > 0 ? aItem->GetNetname().ToStdString( wxConvUTF8 ) : std::string();
+}
+
+
+/**
+ * Rule-resolved clearance between an item and a net-less track on @a aLayer: picks up local
+ * overrides and custom rules (e.g. extra spacing around differential pairs).
+ */
+static double clearanceToTrack( BOARD* aBoard, BOARD_ITEM* aItem, PCB_LAYER_ID aLayer )
+{
+    PCB_TRACK probe( aBoard );
+    probe.SetLayer( aLayer );
+    probe.SetStart( aItem->GetPosition() );
+    probe.SetEnd( aItem->GetPosition() );
+
+    std::shared_ptr<DRC_ENGINE>& engine = aBoard->GetDesignSettings().m_DRCEngine;
+    DRC_CONSTRAINT ab = engine->EvalRules( CLEARANCE_CONSTRAINT, aItem, &probe, aLayer );
+    DRC_CONSTRAINT ba = engine->EvalRules( CLEARANCE_CONSTRAINT, &probe, aItem, aLayer );
+
+    return pcbIUScale.IUTomm( std::max( { 0, ab.GetValue().Min(), ba.GetValue().Min() } ) );
+}
+
+
+static nlohmann::json shapeToJson( BOARD* aBoard, PCB_SHAPE* aShape, int aMaxError )
+{
+    SHAPE_POLY_SET poly;
+    aShape->TransformShapeToPolygon( poly, aShape->GetLayer(), 0, aMaxError, ERROR_OUTSIDE );
+
+    return { { "net", netName( aShape ) },
+             { "layer", layerName( aBoard, aShape->GetLayer() ) },
+             { "poly", polySetToJson( poly ) },
+             { "clearance", clearanceToTrack( aBoard, aShape, aShape->GetLayer() ) } };
+}
+
+
+static nlohmann::json ruleAreaToJson( BOARD* aBoard, ZONE* aZone )
+{
+    return { { "name", aZone->GetZoneName().ToStdString( wxConvUTF8 ) },
+             { "layers", copperLayersToJson( aBoard, aZone->GetLayerSet() ) },
+             { "no_tracks", aZone->GetDoNotAllowTracks() },
+             { "no_vias", aZone->GetDoNotAllowVias() },
+             { "poly", polySetToJson( *aZone->Outline() ) } };
+}
+
+
+/**
+ * Write the copper geometry, net classes and rule areas a path planner needs, in mm.
+ */
+static void dumpBoard( BOARD* aBoard, const std::string& aPath )
+{
+    const BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
+    const int                    maxError = bds.m_MaxError;
+    nlohmann::json               out;
+
+    out["layers"] = copperLayersToJson( aBoard, LSET::AllCuMask() );
+    out["rules"] = { { "min_clearance", pcbIUScale.IUTomm( bds.m_MinClearance ) },
+                     { "edge_clearance", pcbIUScale.IUTomm( bds.m_CopperEdgeClearance ) },
+                     { "hole_clearance", pcbIUScale.IUTomm( bds.m_HoleClearance ) },
+                     { "hole_to_hole", pcbIUScale.IUTomm( bds.m_HoleToHoleMin ) },
+                     { "min_track_width", pcbIUScale.IUTomm( bds.m_TrackMinWidth ) },
+                     { "min_via_diameter", pcbIUScale.IUTomm( bds.m_ViasMinSize ) },
+                     { "min_through_drill", pcbIUScale.IUTomm( bds.m_MinThroughDrill ) } };
+
+    // Copper-to-edge clearance is measured from the Edge.Cuts stroke, not its centreline.
+    int edgeWidth = 0;
+
+    for( BOARD_ITEM* item : aBoard->Drawings() )
+    {
+        if( item->Type() == PCB_SHAPE_T && item->GetLayer() == Edge_Cuts )
+            edgeWidth = std::max( edgeWidth, static_cast<PCB_SHAPE*>( item )->GetWidth() );
+    }
+
+    out["rules"]["edge_cut_width"] = pcbIUScale.IUTomm( edgeWidth );
+
+    nlohmann::json nets = nlohmann::json::object();
+
+    for( NETINFO_ITEM* net : aBoard->GetNetInfo() )
+    {
+        if( net->GetNetCode() <= 0 )
+            continue;
+
+        NETCLASS* nc = net->GetNetClass();
+
+        // Same rule evaluation the router's ImportSizes() does, so custom width rules count.
+        PCB_TRACK track( aBoard );
+        track.SetLayer( F_Cu );
+        track.SetNet( net );
+
+        PCB_VIA via( aBoard );
+        via.SetNet( net );
+        via.SetViaType( VIATYPE::THROUGH );
+        via.SetLayerPair( F_Cu, B_Cu );
+
+        std::shared_ptr<DRC_ENGINE>& engine = aBoard->GetDesignSettings().m_DRCEngine;
+        DRC_CONSTRAINT width = engine->EvalRules( TRACK_WIDTH_CONSTRAINT, &track, nullptr, F_Cu );
+        DRC_CONSTRAINT viaDia = engine->EvalRules( VIA_DIAMETER_CONSTRAINT, &via, nullptr, F_Cu );
+        DRC_CONSTRAINT viaHole = engine->EvalRules( HOLE_SIZE_CONSTRAINT, &via, nullptr, F_Cu );
+
+        int trackWidth = netClassTrackWidth( bds, net, width );
+        int viaDiameter = viaDia.IsNull() ? nc->GetViaDiameter() : viaDia.GetValue().Opt();
+        int viaDrill = viaHole.IsNull() ? nc->GetViaDrill() : viaHole.GetValue().Opt();
+
+        nets[net->GetNetname().ToStdString( wxConvUTF8 )] = {
+            { "netclass", nc->GetName().ToStdString( wxConvUTF8 ) },
+            { "track", pcbIUScale.IUTomm( trackWidth ) },
+            { "clearance", pcbIUScale.IUTomm( nc->GetClearance() ) },
+            { "via_diameter", pcbIUScale.IUTomm( viaDiameter ) },
+            { "via_drill", pcbIUScale.IUTomm( viaDrill ) } };
+    }
+
+    out["nets"] = nets;
+
+    SHAPE_POLY_SET outline;
+
+    if( aBoard->GetBoardPolygonOutlines( outline, true ) )
+        out["outline"] = polySetToJson( outline );
+
+    nlohmann::json tracks = nlohmann::json::array();
+    nlohmann::json vias = nlohmann::json::array();
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        if( track->Type() == PCB_VIA_T )
+        {
+            PCB_VIA*     via = static_cast<PCB_VIA*>( track );
+            PCB_LAYER_ID top, bottom;
+            via->LayerPair( &top, &bottom );
+
+            vias.push_back( { { "net", netName( via ) },
+                              { "pos", pointToJson( via->GetPosition() ) },
+                              { "diameter", pcbIUScale.IUTomm( via->GetWidth( top ) ) },
+                              { "drill", pcbIUScale.IUTomm( via->GetDrillValue() ) },
+                              { "layers", copperLayersToJson( aBoard, via->GetLayerSet() ) },
+                              { "locked", via->IsLocked() },
+                              { "clearance", clearanceToTrack( aBoard, via, top ) } } );
+            continue;
+        }
+
+        std::vector<std::pair<VECTOR2I, VECTOR2I>> pieces;
+
+        if( track->Type() == PCB_ARC_T )
+        {
+            PCB_ARC*         arc = static_cast<PCB_ARC*>( track );
+            SHAPE_LINE_CHAIN chain = SHAPE_ARC( arc->GetStart(), arc->GetMid(), arc->GetEnd(), 0 )
+                                             .ConvertToPolyline( maxError );
+
+            for( int i = 0; i < chain.SegmentCount(); i++ )
+                pieces.emplace_back( chain.CSegment( i ).A, chain.CSegment( i ).B );
+        }
+        else
+        {
+            pieces.emplace_back( track->GetStart(), track->GetEnd() );
+        }
+
+        double clearance = clearanceToTrack( aBoard, track, track->GetLayer() );
+
+        for( const auto& [a, b] : pieces )
+        {
+            tracks.push_back( { { "net", netName( track ) },
+                                { "layer", layerName( aBoard, track->GetLayer() ) },
+                                { "a", pointToJson( a ) },
+                                { "b", pointToJson( b ) },
+                                { "width", pcbIUScale.IUTomm( track->GetWidth() ) },
+                                { "locked", track->IsLocked() },
+                                { "clearance", clearance } } );
+        }
+    }
+
+    out["tracks"] = tracks;
+    out["vias"] = vias;
+
+    nlohmann::json pads = nlohmann::json::array();
+    nlohmann::json shapes = nlohmann::json::array();
+    nlohmann::json areas = nlohmann::json::array();
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( PAD* pad : fp->Pads() )
+        {
+            nlohmann::json polys = nlohmann::json::object();
+            LSET           cu = pad->GetLayerSet() & aBoard->GetEnabledLayers() & LSET::AllCuMask();
+
+            for( PCB_LAYER_ID layer : cu )
+            {
+                if( pad->FlashLayer( layer ) )
+                    polys[layerName( aBoard, layer )] = polySetToJson( *pad->GetEffectivePolygon( layer ) );
+            }
+
+            nlohmann::json entry = { { "net", netName( pad ) },
+                                     { "ref", fp->GetReference().ToStdString( wxConvUTF8 ) },
+                                     { "number", pad->GetNumber().ToStdString( wxConvUTF8 ) },
+                                     { "pos", pointToJson( pad->GetPosition() ) },
+                                     { "layers", copperLayersToJson( aBoard, cu ) },
+                                     { "polys", polys },
+                                     { "clearance", cu.any()
+                                                    ? clearanceToTrack( aBoard, pad, cu.Seq().front() )
+                                                    : 0.0 } };
+
+            if( pad->HasHole() )
+            {
+                std::shared_ptr<SHAPE_SEGMENT> hole = pad->GetEffectiveHoleShape();
+                entry["hole"] = { { "a", pointToJson( hole->GetSeg().A ) },
+                                  { "b", pointToJson( hole->GetSeg().B ) },
+                                  { "width", pcbIUScale.IUTomm( hole->GetWidth() ) } };
+            }
+
+            pads.push_back( entry );
+        }
+
+        for( BOARD_ITEM* item : fp->GraphicalItems() )
+        {
+            if( item->Type() == PCB_SHAPE_T && IsCopperLayer( item->GetLayer() ) )
+                shapes.push_back( shapeToJson( aBoard, static_cast<PCB_SHAPE*>( item ), maxError ) );
+        }
+
+        for( ZONE* zone : fp->Zones() )
+        {
+            if( zone->GetIsRuleArea() )
+                areas.push_back( ruleAreaToJson( aBoard, zone ) );
+        }
+    }
+
+    for( BOARD_ITEM* item : aBoard->Drawings() )
+    {
+        if( item->Type() == PCB_SHAPE_T && IsCopperLayer( item->GetLayer() ) )
+            shapes.push_back( shapeToJson( aBoard, static_cast<PCB_SHAPE*>( item ), maxError ) );
+    }
+
+    for( ZONE* zone : aBoard->Zones() )
+    {
+        if( zone->GetIsRuleArea() )
+            areas.push_back( ruleAreaToJson( aBoard, zone ) );
+    }
+
+    out["pads"] = pads;
+    out["shapes"] = shapes;
+    out["areas"] = areas;
+
+    std::ofstream file( aPath );
+    file << out.dump();
+}
+
+
 static void reportFatal( const std::string& aMessage )
 {
     nlohmann::json out;
@@ -644,10 +1004,19 @@ static void reportFatal( const std::string& aMessage )
 
 int main( int argc, char** argv )
 {
+    bool dumpOnly = argc == 4 && std::string( argv[1] ) == "--dump";
+
     if( argc != 4 )
     {
-        std::cerr << "usage: pns_headless_route board.kicad_pcb jobs.json out.kicad_pcb\n";
+        std::cerr << "usage: pns_headless_route board.kicad_pcb jobs.json out.kicad_pcb\n"
+                     "       pns_headless_route --dump board.kicad_pcb geometry.json\n";
         return 2;
+    }
+
+    if( dumpOnly )
+    {
+        argv++;
+        argc--;
     }
 
     // Keep this build's settings away from an installed KiCad of the same version.
@@ -683,15 +1052,18 @@ int main( int argc, char** argv )
 
     nlohmann::json jobs;
 
-    try
+    if( !dumpOnly )
     {
-        std::ifstream jobsFile( argv[2] );
-        jobs = nlohmann::json::parse( jobsFile );
-    }
-    catch( const std::exception& e )
-    {
-        reportFatal( std::string( "cannot parse jobs: " ) + e.what() );
-        return 1;
+        try
+        {
+            std::ifstream jobsFile( argv[2] );
+            jobs = nlohmann::json::parse( jobsFile );
+        }
+        catch( const std::exception& e )
+        {
+            reportFatal( std::string( "cannot parse jobs: " ) + e.what() );
+            return 1;
+        }
     }
 
     std::unique_ptr<BOARD> board;
@@ -715,6 +1087,11 @@ int main( int argc, char** argv )
 
     board->SetProject( &mgr.Prj() );
 
+    board->BuildConnectivity();
+    board->BuildListOfNets();
+    board->SynchronizeNetsAndNetClasses( true );
+
+    // The engine compiles the implicit net class rules, so it must see the project's net classes.
     BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
     bds.m_DRCEngine = std::make_shared<DRC_ENGINE>( board.get(), &bds );
 
@@ -731,9 +1108,11 @@ int main( int argc, char** argv )
         return 1;
     }
 
-    board->BuildConnectivity();
-    board->BuildListOfNets();
-    board->SynchronizeNetsAndNetClasses( true );
+    if( dumpOnly )
+    {
+        dumpBoard( board.get(), argv[2] );
+        return 0;
+    }
 
     nlohmann::json results = nlohmann::json::array();
     int            routed = 0;
@@ -764,6 +1143,7 @@ int main( int argc, char** argv )
             }
 
             entry["status"] = res.ok ? "routed" : "failed";
+            entry["sizes"] = router.LastSizes();
 
             if( res.ok )
             {
