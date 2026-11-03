@@ -130,6 +130,7 @@ public:
 
     int ShoveIterationLimit() const;
     TIME_LIMIT ShoveTimeLimit() const;
+    void SetShoveTimeLimit( int aMilliseconds ) { m_shoveTimeLimit.Set( aMilliseconds ); }
 
     int WalkaroundIterationLimit() const { return m_walkaroundIterationLimit; };
     TIME_LIMIT WalkaroundTimeLimit() const;

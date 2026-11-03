@@ -468,6 +468,8 @@ public:
         m_settings->SetSmartPads( true );
         m_settings->SetShoveVias( true );
         m_settings->SetAllowDRCViolations( false );
+        // the iteration limit alone bounds a shove: a wall-clock limit makes results depend on machine load
+        m_settings->SetShoveTimeLimit( 3600 * 1000 );
 
         m_router->LoadSettings( m_settings.get() );
         m_router->SetMode( PNS::PNS_MODE_ROUTE_SINGLE );
