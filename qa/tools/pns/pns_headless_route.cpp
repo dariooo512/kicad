@@ -67,7 +67,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <advanced_config.h>
 #include <board.h>
+#include <kiid.h>
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
 #include <kiface_base.h>
@@ -470,6 +472,10 @@ public:
         m_settings->SetAllowDRCViolations( false );
         // the iteration limit alone bounds a shove: a wall-clock limit makes results depend on machine load
         m_settings->SetShoveTimeLimit( 3600 * 1000 );
+        // same for walkaround's per-cluster and the tuner's branch-walk limits (ADVANCED_CFG, 100/500 ms)
+        auto& cfg = const_cast<ADVANCED_CFG&>( ADVANCED_CFG::GetCfg() );
+        cfg.m_PNSProcessClusterTimeout = 3600 * 1000;
+        cfg.m_FollowBranchTimeout = 3600 * 1000;
 
         m_router->LoadSettings( m_settings.get() );
         m_router->SetMode( PNS::PNS_MODE_ROUTE_SINGLE );
@@ -1152,6 +1158,10 @@ static std::set<std::string> splitList( const std::string& aList )
 
 int main( int argc, char** argv )
 {
+    // new tracks and vias get uuids from this generator, and the board orders items by uuid: a fixed
+    // seed makes a later job in the same run see the same item order every time
+    KIID::SeedGenerator( 1 );
+
     std::vector<char*> args = { argv[0] };
     bool               dumpOnly = false;
 

@@ -15,7 +15,7 @@ Afterwards a stitching via is tried for each GND pour island cut off from the ma
 overlaps the main pour on another layer and a via fits cleanly.
 
 Environment: PNS_TOOL (pns_headless_route), KICAD_CLI (a Windows kicad-cli.exe works from WSL),
-PYTHON (interpreter for pns_plan.py, with numpy, scipy, pillow and ideally numba).
+PYTHON (interpreter for pns_plan.py, with numpy, scipy, pillow, shapely and ideally numba).
 """
 import argparse
 import json
@@ -26,6 +26,8 @@ import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
+
+from pns_normalise import normalise
 
 HERE = Path(__file__).resolve().parent
 TOOL = os.environ.get('PNS_TOOL', 'pns_headless_route')
@@ -65,11 +67,18 @@ class Workdir:
     def drc(self, name, refill):
         out = self.dir / f'{name}.drc{"_refill" if refill else ""}.json'
         cmd = [CLI, 'pcb', 'drc', '--format', 'json', '-o', cli_path(out)]
+        board = self.dir / f'{name}.kicad_pcb'
         if refill:
-            cmd.append('--refill-zones')
-        subprocess.run(cmd + [cli_path(self.dir / f'{name}.kicad_pcb')], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # the refilled copy gives pns_plan the zone islands for its own gap search
+            board = self.stage(board, f'{name}.filled')
+            cmd += ['--refill-zones', '--save-board']
+        subprocess.run(cmd + [cli_path(board)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return json.load(open(out, encoding='utf-8'))
+
+    def adopt(self, trial, name):
+        """Make @trial's board and its refilled DRC the round's result @name."""
+        for suffix in ('.kicad_pcb', '.drc_refill.json', '.filled.kicad_pcb'):
+            shutil.copyfile(self.dir / f'{trial}{suffix}', self.dir / f'{name}{suffix}')
 
     def route(self, src_name, jobs, out_name):
         jobs_path = self.dir / f'{out_name}.jobs.json'
@@ -77,6 +86,7 @@ class Workdir:
         self.stage(self.dir / f'{src_name}.kicad_pcb', out_name)
         res = subprocess.run([TOOL, *TOOL_ARGS, str(self.dir / f'{src_name}.kicad_pcb'), str(jobs_path),
                               str(self.dir / f'{out_name}.kicad_pcb')], capture_output=True, text=True)
+        normalise(self.dir / f'{out_name}.kicad_pcb')
         result = json.loads(res.stdout)
         json.dump(result, open(self.dir / f'{out_name}.route.json', 'w'), indent=1)
         return result
@@ -305,7 +315,7 @@ def main():
         args.plan_arg.append(f'--nets={args.nets}')
 
     wd = Workdir(args.board, args.workdir)
-    wd.stage(args.board, 'r0')
+    normalise(wd.stage(args.board, 'r0'))
     base = wd.drc('r0', refill=True)
     subprocess.run([TOOL, *TOOL_ARGS, '--dump', str(wd.dir / 'r0.kicad_pcb'), str(wd.dir / 'r0.geom.json')],
                    check=True)
@@ -321,8 +331,9 @@ def main():
         drc_path = wd.dir / f'{current}.drc_refill.json'
         plan_jobs = wd.dir / f'{current}.plan_jobs.json'
         with open(wd.dir / f'{current}.plan.json', 'w') as report:
-            subprocess.run([PYTHON, str(HERE / 'pns_plan.py'), str(geom), str(drc_path), str(plan_jobs), *args.plan_arg],
-                           check=True, stdout=report, stderr=subprocess.DEVNULL)
+            subprocess.run([PYTHON, str(HERE / 'pns_plan.py'), str(geom), str(drc_path), str(plan_jobs),
+                            f'--fills={wd.dir / f"{current}.filled.kicad_pcb"}', *args.plan_arg],
+                           check=True, stdout=report, stderr=open(wd.dir / f'{current}.plan.log', 'w'))
         jobs = [j for j in json.load(open(plan_jobs)) if j['gap'] not in rejected]
         if not jobs:
             print(f'round {r}: no plannable gaps left', flush=True)
@@ -378,7 +389,7 @@ def main():
                     if health(trial_drc, baseline, wd.dir / f'{trial}.kicad_pcb') is None:
                         accepted.append(job)
                         drc, result = trial_drc, res
-                        shutil.copyfile(wd.dir / f'{trial}.kicad_pcb', wd.dir / f'{name}.kicad_pcb')
+                        wd.adopt(trial, name)
                     else:
                         print(f'  leaving out {job["gap"]}', flush=True)
                 if not accepted:
@@ -403,6 +414,7 @@ def main():
         wd.stage(wd.dir / f'{current}.kicad_pcb', 'locked')
         subprocess.run([TOOL, *TOOL_ARGS, f'--lock-nets={args.lock_nets}', str(wd.dir / f'{current}.kicad_pcb'),
                         str(empty), str(wd.dir / 'locked.kicad_pcb')], check=True, stdout=subprocess.DEVNULL)
+        normalise(wd.dir / 'locked.kicad_pcb')
         current = 'locked'
 
     shutil.copyfile(wd.dir / f'{current}.kicad_pcb', wd.dir / 'final.kicad_pcb')

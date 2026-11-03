@@ -100,13 +100,49 @@ struct OBSTACLE
         return m_head == other.m_head && m_item == other.m_item;
     }
 
+    // Geometric order first: callers take the first of equally near obstacles, and a pointer
+    // order would make that choice (and the route) depend on heap layout.
+    static bool ItemLess( const ITEM* aA, const ITEM* aB )
+    {
+        if( aA == aB )
+            return false;
+
+        if( !aA || !aB )
+            return (uintptr_t) aA < (uintptr_t) aB;
+
+        if( aA->Kind() != aB->Kind() )
+            return aA->Kind() < aB->Kind();
+
+        if( aA->Layers().Start() != aB->Layers().Start() )
+            return aA->Layers().Start() < aB->Layers().Start();
+
+        if( aA->Layers().End() != aB->Layers().End() )
+            return aA->Layers().End() < aB->Layers().End();
+
+        if( aA->AnchorCount() != aB->AnchorCount() )
+            return aA->AnchorCount() < aB->AnchorCount();
+
+        for( int i = 0; i < aA->AnchorCount(); i++ )
+        {
+            const VECTOR2I pa = aA->Anchor( i );
+            const VECTOR2I pb = aB->Anchor( i );
+
+            if( pa.x != pb.x )
+                return pa.x < pb.x;
+
+            if( pa.y != pb.y )
+                return pa.y < pb.y;
+        }
+
+        return (uintptr_t) aA < (uintptr_t) aB;
+    }
+
     bool operator<(const OBSTACLE& other) const
     {
-        if( (uintptr_t)m_head < (uintptr_t)other.m_head )
-            return true;
-        else if ( m_head == other.m_head )
-            return (uintptr_t)m_item < (uintptr_t)other.m_item;
-        return false;
+        if( m_head != other.m_head )
+            return ItemLess( m_head, other.m_head );
+
+        return ItemLess( m_item, other.m_item );
     }
 };
 

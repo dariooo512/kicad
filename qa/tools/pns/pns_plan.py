@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Grid A* planner producing waypoint jobs for pns_headless_route.
 
-usage: pns_plan.py geometry.json drc.json jobs.json [--pitch 0.05] [--only NET,...]
+usage: pns_plan.py geometry.json drc.json jobs.json [--fills refilled.kicad_pcb] [--pitch 0.05] [--only NET,...]
                    [--signal-layers F.Cu,In2.Cu,...] [--rail-layer In4.Cu --rail-nets REGEX]
 
 geometry.json comes from `pns_headless_route --dump`, drc.json from `kicad-cli pcb drc --format json`.
+With --fills (the board saved by `kicad-cli pcb drc --refill-zones --save-board`) the gaps come from
+pns_gaps.py, so they do not depend on which of several equal endpoints DRC happens to report.
 Each unconnected gap becomes a job with up to three alternative waypoint plans.  The search runs
 on the signal layers only, sizes tracks and vias from the net class, keeps clearance from
 locked copper, pads, holes, keepouts and the board edge, and may cross unlocked foreign copper at
@@ -517,6 +519,42 @@ def plan_gap(board, a, b, margin_mm):
     return plans, notes
 
 
+def canonical(geom):
+    """Items in a geometric order, so random KIIDs (the dump's order) cannot steer the plan."""
+    geom['pads'].sort(key=lambda p: (p['net'], tuple(p['pos']), p.get('ref', ''), p.get('number', '')))
+    geom['vias'].sort(key=lambda v: (v['net'], tuple(v['pos'])))
+    geom['tracks'].sort(key=lambda t: (t['net'], t['layer'], tuple(t['a']), tuple(t['b'])))
+    return geom
+
+
+def ordered(jobs, order):
+    if order == 'net':
+        return jobs
+    if order in ('short', 'long'):
+        return sorted(jobs, key=lambda j: math.dist(j['start'], j['end']), reverse=order == 'long')
+    if order.startswith('seed:'):
+        import hashlib
+        return sorted(jobs, key=lambda j: hashlib.sha256(f'{order}|{j["gap"]}'.encode()).hexdigest())
+    raise SystemExit(f'unknown --order {order}')
+
+
+def gap_endpoints(board, geom, drc, fills, report):
+    """(a, b, description) per gap: from the board's own clusters with --fills, else DRC's endpoints."""
+    if fills:
+        import pns_gaps
+        for a, b in pns_gaps.gaps(geom, pns_gaps.zone_fills(fills), drc):
+            if a['net'] in geom['nets']:
+                yield a, b, f'{pns_gaps.describe(a)} | {pns_gaps.describe(b)}'
+        return
+    for gap in drc['unconnected_items']:
+        items = [parse_item(board, i) for i in gap['items'][:2]]
+        desc = ' | '.join(i['description'] for i in gap['items'])
+        if None in items or items[0]['net'] != items[1]['net'] or items[0]['net'] not in geom['nets']:
+            report.append({'gap': desc, 'status': 'skipped'})
+            continue
+        yield items[0], items[1], desc
+
+
 def main():
     global SIGNAL_LAYERS, RAIL_LAYER, RAIL_NET, SMALL_VIA_AREAS, SOFT_VIA_PUSH
     ap = argparse.ArgumentParser()
@@ -528,6 +566,11 @@ def main():
     ap.add_argument('--only', default='')
     ap.add_argument('--nets', default='', help='regex: plan only gaps of matching nets')
     ap.add_argument('--modes', default='shove,walkaround')
+    ap.add_argument('--order', default='net',
+                    help="job order: net (name, position), short / long (gap length first), or seed:N "
+                         "(a reproducible shuffle)")
+    ap.add_argument('--fills', default='',
+                    help='board saved after a zone refill: compute the gaps from geometry, not from DRC endpoints')
     # Diagnosis only: plans that need locked copper moved are not routable by pns_headless_route.
     ap.add_argument('--locked-soft', action='store_true')
     ap.add_argument('--shove-pinned', action='store_true',
@@ -547,7 +590,7 @@ def main():
     RAIL_NET = re.compile(args.rail_nets)
 
     t0 = time.time()
-    geom = json.load(open(args.geometry))
+    geom = canonical(json.load(open(args.geometry)))
     board = Board(geom, args.pitch, args.locked_soft, args.shove_pinned)
     print(f'rasterised {board.grid.w}x{board.grid.h}x{len(board.layers)} in {time.time() - t0:.1f}s',
           file=sys.stderr)
@@ -556,13 +599,8 @@ def main():
     only = set(filter(None, args.only.split(',')))
     net_filter = re.compile(args.nets) if args.nets else None
     jobs, report = [], []
-    for gap in drc['unconnected_items']:
-        items = [parse_item(board, i) for i in gap['items'][:2]]
-        desc = ' | '.join(i['description'] for i in gap['items'])
-        if None in items or items[0]['net'] != items[1]['net'] or items[0]['net'] not in geom['nets']:
-            report.append({'gap': desc, 'status': 'skipped'})
-            continue
-        a, b = sorted(items, key=lambda it: len(it['layers']))
+    for a, b, desc in gap_endpoints(board, geom, drc, args.fills, report):
+        a, b = sorted((a, b), key=lambda it: (len(it['layers']), tuple(it['pos'])))
         if only and a['net'] not in only:
             continue
         if net_filter and not net_filter.search(a['net']):
@@ -579,7 +617,7 @@ def main():
                      'end': list(b['pos']), 'alternatives': plans, 'modes': args.modes.split(','),
                      'gap': desc})
 
-    out = jobs
+    out = ordered(jobs, args.order)
     json.dump(out, open(args.jobs, 'w'), indent=1)
     json.dump(report, sys.stdout, indent=1)
     print(f'\n{len(out)} jobs in {time.time() - t0:.1f}s', file=sys.stderr)
