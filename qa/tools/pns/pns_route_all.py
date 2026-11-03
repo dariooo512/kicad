@@ -32,6 +32,7 @@ TOOL = os.environ.get('PNS_TOOL', 'pns_headless_route')
 CLI = os.environ.get('KICAD_CLI', 'kicad-cli')
 PYTHON = os.environ.get('PYTHON', sys.executable)
 TOOL_ARGS = []
+ALLOW_ISLANDS = False  # mid-pipeline: autoroute stitches GND islands later
 
 HIGH_SPEED_TYPES = {'skew_out_of_range', 'diff_pair_uncoupled_length_too_long', 'diff_pair_gap_out_of_range',
                     'too_many_vias', 'length_out_of_range'}
@@ -126,7 +127,7 @@ def health(drc, base, pcb):
         return f'new violation types {sorted(new_types)}'
     if worse:
         return f'more {worse}'
-    if zone_gaps(drc) > base.zone_gaps:
+    if not ALLOW_ISLANDS and zone_gaps(drc) > base.zone_gaps:
         return f'zone islands {zone_gaps(drc)} > {base.zone_gaps}'
     if base.critical and copper_blocks(pcb, base.critical) != base.critical_blocks:
         return 'critical copper changed'
@@ -289,7 +290,11 @@ def main():
     ap.add_argument('--plan-arg', action='append', default=[], help='extra pns_plan.py option (repeatable)')
     ap.add_argument('--nets', default='', help='regex: route only gaps of matching nets')
     ap.add_argument('--lock-nets', default='', help='regex: lock the copper of these nets in the final board')
+    ap.add_argument('--allow-zone-islands', action='store_true',
+                    help='accept rounds that cut pours into more islands (a later step stitches them)')
     args = ap.parse_args()
+    global ALLOW_ISLANDS
+    ALLOW_ISLANDS = args.allow_zone_islands
 
     TOOL_ARGS.extend([f'--critical-classes={args.critical_classes}'])
     if args.critical_nets:
